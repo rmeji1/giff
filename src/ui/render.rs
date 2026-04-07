@@ -84,6 +84,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     if app.show_help_modal {
         render_help_modal(f, app, size);
     }
+
+    if app.comment_input.is_some() {
+        render_comment_input(f, app, size);
+    }
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -142,6 +146,16 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     spans.push(Span::styled(
         format!("{}/{}", current, file_count),
         Style::default().fg(t.fg_dim),
+    ));
+    spans.push(Span::styled(
+        " \u{2502} ",
+        Style::default().fg(t.border_dim),
+    ));
+    spans.push(Span::styled(
+        "watching",
+        Style::default()
+            .fg(t.fg_added)
+            .add_modifier(Modifier::DIM),
     ));
 
     let header = Paragraph::new(Line::from(spans)).style(Style::default().bg(t.bg_header));
@@ -225,6 +239,7 @@ fn render_diff_pane(
     filename: &str,
     scroll: usize,
     is_focused: bool,
+    cursor_line: Option<usize>,
     area: Rect,
     theme: &Theme,
 ) {
@@ -241,7 +256,22 @@ fn render_diff_pane(
         Style::default().fg(theme.fg_dim)
     };
 
-    let highlighted = highlight_line_changes(lines, filename, theme);
+    let mut highlighted = highlight_line_changes(lines, filename, theme);
+
+    // Apply cursor highlight
+    if let Some(cl) = cursor_line {
+        if cl < highlighted.len() {
+            let cursor_style = Style::default().bg(theme.accent).fg(theme.bg_default);
+            highlighted[cl] = Line::from(
+                highlighted[cl]
+                    .spans
+                    .iter()
+                    .map(|span| Span::styled(span.content.clone(), cursor_style))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
     let total_lines = highlighted.len();
     let content = Text::from(highlighted);
     let visible_height = area.height.saturating_sub(2) as usize;
@@ -428,23 +458,31 @@ fn render_side_by_side(f: &mut Frame, app: &App, base_area: Rect, head_area: Rec
 
     let (aligned_base, aligned_head) = align_lines(base_lines, head_lines);
 
+    let cursor = if is_focused {
+        Some(app.cursor_line)
+    } else {
+        None
+    };
+
     render_diff_pane(
         f,
-        app.left_label,
+        &app.left_label,
         &aligned_base,
         current_file,
         scroll,
         is_focused,
+        cursor,
         base_area,
         &app.theme,
     );
     render_diff_pane(
         f,
-        app.right_label,
+        &app.right_label,
         &aligned_head,
         current_file,
         scroll,
         is_focused,
+        cursor,
         head_area,
         &app.theme,
     );
@@ -507,6 +545,12 @@ fn render_unified_diff(f: &mut Frame, app: &App, area: Rect) {
     let unified_lines = build_unified_lines(base_lines, head_lines);
 
     let title = format!("{} vs {}", app.left_label, app.right_label);
+    let cursor = if is_focused {
+        Some(app.cursor_line)
+    } else {
+        None
+    };
+
     render_diff_pane(
         f,
         &title,
@@ -514,6 +558,7 @@ fn render_unified_diff(f: &mut Frame, app: &App, area: Rect) {
         current_file,
         scroll,
         is_focused,
+        cursor,
         area,
         &app.theme,
     );
@@ -703,6 +748,67 @@ fn render_help_modal(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, inner);
 }
 
+fn render_comment_input(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let ci = match &app.comment_input {
+        Some(ci) => ci,
+        None => return,
+    };
+
+    // 3-row overlay at the bottom of the screen
+    let height = 4u16;
+    let overlay = Rect::new(area.x, area.height.saturating_sub(height), area.width, height);
+
+    let title = format!(" Comment on {}:{} ", ci.file, ci.line_num);
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.accent))
+        .style(Style::default().bg(t.bg_modal));
+
+    f.render_widget(Clear, overlay);
+    f.render_widget(&block, overlay);
+
+    let inner = block.inner(overlay);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    // Text input with cursor
+    let before_cursor = &ci.text[..ci.cursor_pos];
+    let cursor_char = ci.text.get(ci.cursor_pos..ci.cursor_pos + 1).unwrap_or(" ");
+    let after_cursor = if ci.cursor_pos < ci.text.len() {
+        &ci.text[ci.cursor_pos + 1..]
+    } else {
+        ""
+    };
+
+    let input_line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(t.accent)),
+        Span::styled(before_cursor.to_string(), Style::default().fg(t.fg_normal)),
+        Span::styled(
+            cursor_char.to_string(),
+            Style::default().fg(t.bg_modal).bg(t.fg_normal),
+        ),
+        Span::styled(after_cursor.to_string(), Style::default().fg(t.fg_normal)),
+    ]);
+    f.render_widget(Paragraph::new(input_line), chunks[0]);
+
+    // Hint line
+    let hints = Line::from(vec![
+        Span::styled("Enter", Style::default().fg(t.fg_key)),
+        Span::styled(" send to Claude Code  ", Style::default().fg(t.fg_dim)),
+        Span::styled("Esc", Style::default().fg(t.fg_key)),
+        Span::styled(" cancel", Style::default().fg(t.fg_dim)),
+    ]);
+    f.render_widget(Paragraph::new(hints), chunks[1]);
+}
+
 fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     if r.width == 0 || r.height == 0 {
         return r;
@@ -756,6 +862,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
             ("u", "View"),
             ("t", "Theme"),
             ("PgUp/Dn", "Page"),
+            ("c", "Comment"),
             ("r", "Rebase"),
             ("?", "Help"),
         ],

@@ -3,12 +3,12 @@ mod rebase;
 pub(crate) mod render;
 mod syntax;
 pub(crate) mod theme;
-mod types;
+pub(crate) mod types;
 
 #[cfg(test)]
 mod tests;
 
-use crate::diff::FileChanges;
+use crate::diff::{DiffSource, FileChanges, FileFilter};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -35,10 +35,12 @@ fn restore_terminal() {
 
 pub fn run_app(
     file_changes: FileChanges,
-    left_label: &str,
-    right_label: &str,
+    left_label: String,
+    right_label: String,
+    diff_source: DiffSource,
     theme: theme::Theme,
     rebase_notification: Option<String>,
+    file_filter: FileFilter,
 ) -> Result<(), Box<dyn Error>> {
     // Install a panic hook that restores the terminal before printing the
     // panic message. Without this, a panic leaves the terminal in raw mode
@@ -77,9 +79,10 @@ pub fn run_app(
     }
 
     let app = App {
-        file_changes: &file_changes,
+        file_changes,
         left_label,
         right_label,
+        diff_source,
         current_file_idx: 0,
         file_names,
         scroll_positions,
@@ -95,6 +98,9 @@ pub fn run_app(
         theme,
         theme_cycle,
         theme_cycle_idx: 0,
+        file_filter,
+        comment_input: None,
+        cursor_line: 0,
     };
 
     // Run the main loop

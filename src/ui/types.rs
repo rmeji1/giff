@@ -1,4 +1,4 @@
-use crate::diff::FileChanges;
+use crate::diff::{DiffSource, FileChanges, FileFilter};
 use std::collections::HashMap;
 
 use super::theme::Theme;
@@ -27,10 +27,11 @@ pub struct Change {
     pub base_insert_pos: Option<usize>,
 }
 
-pub struct App<'a> {
-    pub file_changes: &'a FileChanges,
-    pub left_label: &'a str,
-    pub right_label: &'a str,
+pub struct App {
+    pub file_changes: FileChanges,
+    pub left_label: String,
+    pub right_label: String,
+    pub diff_source: DiffSource,
     pub current_file_idx: usize,
     pub file_names: Vec<String>,
     pub scroll_positions: HashMap<String, usize>,
@@ -47,6 +48,18 @@ pub struct App<'a> {
     pub theme: Theme,
     pub theme_cycle: Vec<Theme>,
     pub theme_cycle_idx: usize,
+    pub file_filter: FileFilter,
+    pub comment_input: Option<CommentInput>,
+    /// Line cursor position in the diff content (0-indexed into aligned/unified lines)
+    pub cursor_line: usize,
+}
+
+pub struct CommentInput {
+    pub file: String,
+    pub line_num: usize,
+    pub line_content: String,
+    pub text: String,
+    pub cursor_pos: usize,
 }
 
 pub enum Pane {

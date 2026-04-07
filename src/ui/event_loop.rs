@@ -1,10 +1,11 @@
-use crate::diff;
+use crate::{bourne, diff};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{prelude::*, Terminal};
+use std::collections::HashMap;
 use std::io;
 
 use super::rebase::prepare_rebase_changes;
-use super::render::ui;
+use super::render::{align_lines, aligned_line_count, build_unified_lines, ui, unified_line_count};
 use super::types::*;
 
 fn commit_rebase_changes(app: &mut App) {
@@ -95,6 +96,121 @@ fn navigate_rebase_file(app: &mut App, forward: bool) {
     }
 }
 
+/// Re-fetch the diff and update app state if changes are detected.
+fn refresh_if_changed(app: &mut App) {
+    let new_data = match diff::refresh_diff(&app.diff_source) {
+        Ok(data) => data,
+        Err(_) => return, // Silently skip on error (e.g., git not available)
+    };
+
+    let (mut new_file_changes, new_left_label, new_right_label) = new_data;
+
+    // Apply include/exclude filters
+    app.file_filter.apply(&mut new_file_changes);
+
+    // Only update if the diff actually changed
+    if new_file_changes == app.file_changes {
+        return;
+    }
+
+    // Remember current file name to restore position
+    let current_file_name = app.file_names.get(app.current_file_idx).cloned();
+
+    // Build new sorted file list
+    let mut new_file_names: Vec<String> = new_file_changes.keys().cloned().collect();
+    new_file_names.sort();
+
+    // Restore file index by name, or clamp
+    let new_idx = current_file_name
+        .as_ref()
+        .and_then(|name| new_file_names.iter().position(|n| n == name))
+        .unwrap_or(0)
+        .min(new_file_names.len().saturating_sub(1));
+
+    // Keep scroll positions for files that still exist, add new ones
+    let mut new_scroll_positions = HashMap::new();
+    for name in &new_file_names {
+        let pos = app.scroll_positions.get(name).copied().unwrap_or(0);
+        new_scroll_positions.insert(name.clone(), pos);
+    }
+
+    app.file_changes = new_file_changes;
+    app.left_label = new_left_label;
+    app.right_label = new_right_label;
+    app.file_names = new_file_names;
+    app.scroll_positions = new_scroll_positions;
+    app.current_file_idx = new_idx;
+
+    // Clear rebase state since the diff changed underneath
+    if matches!(app.app_mode, AppMode::Rebase) {
+        app.app_mode = AppMode::Diff;
+        app.rebase_changes.clear();
+        app.current_change_idx = 0;
+    }
+}
+
+/// Get total line count for the current file's diff content.
+fn diff_line_count(app: &App) -> usize {
+    let file = match app.file_names.get(app.current_file_idx) {
+        Some(f) => f,
+        None => return 0,
+    };
+    let (base, head) = match app.file_changes.get(file) {
+        Some(c) => c,
+        None => return 0,
+    };
+    match app.view_mode {
+        ViewMode::SideBySide => aligned_line_count(base, head),
+        ViewMode::Unified => unified_line_count(base, head),
+    }
+}
+
+/// Adjust scroll so the cursor line stays visible within the viewport.
+fn scroll_to_cursor(app: &mut App, visible_height: usize) {
+    let file = match app.file_names.get(app.current_file_idx) {
+        Some(f) => f.clone(),
+        None => return,
+    };
+    let scroll = *app.scroll_positions.get(&file).unwrap_or(&0);
+    if app.cursor_line < scroll {
+        app.scroll_positions.insert(file, app.cursor_line);
+    } else if app.cursor_line >= scroll + visible_height {
+        app.scroll_positions
+            .insert(file, app.cursor_line - visible_height + 1);
+    }
+}
+
+/// Get the line at the cursor position for commenting.
+/// Returns (filename, line_number, cleaned_line_content).
+fn get_line_at_cursor(app: &App) -> Option<(String, usize, String)> {
+    let file = app.file_names.get(app.current_file_idx)?.clone();
+    let (base_lines, head_lines) = app.file_changes.get(&file)?;
+
+    let lines = match app.view_mode {
+        ViewMode::SideBySide => {
+            let (_, aligned_head) = align_lines(base_lines, head_lines);
+            aligned_head
+        }
+        ViewMode::Unified => build_unified_lines(base_lines, head_lines),
+    };
+
+    // Find the first non-gap line at or after the cursor position
+    for line in lines.iter().skip(app.cursor_line) {
+        let (line_num, content) = line;
+        if *line_num > 0 {
+            let cleaned = content
+                .strip_prefix('+')
+                .or_else(|| content.strip_prefix('-'))
+                .or_else(|| content.strip_prefix(' '))
+                .unwrap_or(content)
+                .to_string();
+            return Some((file, *line_num, cleaned));
+        }
+    }
+
+    None
+}
+
 /// Returns `Ok(true)` when the app exits after a successful rebase
 /// (so the caller can print a message), `Ok(false)` for normal exit.
 pub fn run_ui<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<bool>
@@ -104,8 +220,16 @@ where
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        // Block for the first event, then drain any queued events before
-        // redrawing.  This batches rapid scroll inputs so the UI stays snappy.
+        // Poll with a timeout so we can detect file changes even without
+        // user input.  When the timeout expires, re-run git diff and refresh
+        // the view if anything changed.
+        if !event::poll(std::time::Duration::from_secs(1))? {
+            refresh_if_changed(&mut app);
+            continue;
+        }
+
+        // Drain all queued events before redrawing.  This batches rapid
+        // scroll inputs so the UI stays snappy.
         let first = event::read()?;
         let mut events = vec![first];
         while event::poll(std::time::Duration::ZERO)? {
@@ -166,6 +290,71 @@ where
                         }
                         continue; // Skip other key processing when modal is shown
                     }
+
+                    // Handle comment input if active
+                    if let Some(ref mut ci) = app.comment_input {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.comment_input = None;
+                            }
+                            KeyCode::Enter => {
+                                if !ci.text.trim().is_empty() {
+                                    let msg = format!(
+                                        "[giff] {}:{}: \"{}\" — {}",
+                                        ci.file, ci.line_num, ci.line_content, ci.text
+                                    );
+                                    match diff::git_repo_root() {
+                                        Ok(dir) => match bourne::send_comment(&dir, &msg) {
+                                            Ok(()) => {
+                                                app.status_message =
+                                                    Some("Comment sent to Claude Code".to_string());
+                                            }
+                                            Err(e) => {
+                                                app.status_message =
+                                                    Some(format!("Error: {}", e));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            app.status_message = Some(format!("Error: {}", e));
+                                        }
+                                    }
+                                }
+                                app.comment_input = None;
+                            }
+                            KeyCode::Backspace => {
+                                if ci.cursor_pos > 0 {
+                                    ci.text.remove(ci.cursor_pos - 1);
+                                    ci.cursor_pos -= 1;
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if ci.cursor_pos < ci.text.len() {
+                                    ci.text.remove(ci.cursor_pos);
+                                }
+                            }
+                            KeyCode::Left => {
+                                ci.cursor_pos = ci.cursor_pos.saturating_sub(1);
+                            }
+                            KeyCode::Right => {
+                                if ci.cursor_pos < ci.text.len() {
+                                    ci.cursor_pos += 1;
+                                }
+                            }
+                            KeyCode::Home => {
+                                ci.cursor_pos = 0;
+                            }
+                            KeyCode::End => {
+                                ci.cursor_pos = ci.text.len();
+                            }
+                            KeyCode::Char(ch) => {
+                                ci.text.insert(ci.cursor_pos, ch);
+                                ci.cursor_pos += 1;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             match app.app_mode {
@@ -192,22 +381,39 @@ where
                                 set_change_state(&mut app, ChangeState::Rejected);
                             }
                         }
-                        KeyCode::Char('c') => {
-                            if let AppMode::Rebase = app.app_mode {
+                        KeyCode::Char('c') => match app.app_mode {
+                            AppMode::Rebase => {
                                 commit_rebase_changes(&mut app);
                             }
-                        }
+                            AppMode::Diff => {
+                                if let Some((file, line_num, line_content)) =
+                                    get_line_at_cursor(&app)
+                                {
+                                    app.comment_input = Some(CommentInput {
+                                        file,
+                                        line_num,
+                                        line_content,
+                                        text: String::new(),
+                                        cursor_pos: 0,
+                                    });
+                                }
+                            }
+                        },
                         KeyCode::Char('j') | KeyCode::Down => match app.app_mode {
                             AppMode::Diff => match app.focused_pane {
                                 Pane::FileList => {
                                     if app.current_file_idx + 1 < app.file_names.len() {
                                         app.current_file_idx += 1;
+                                        app.cursor_line = 0;
                                     }
                                 }
                                 Pane::DiffContent => {
-                                    if let Some(file) = app.file_names.get(app.current_file_idx) {
-                                        let scroll = *app.scroll_positions.get(file).unwrap_or(&0);
-                                        app.scroll_positions.insert(file.clone(), scroll + 1);
+                                    let total = diff_line_count(&app);
+                                    if total > 0 && app.cursor_line + 1 < total {
+                                        app.cursor_line += 1;
+                                        let page =
+                                            terminal.size()?.height.saturating_sub(6) as usize;
+                                        scroll_to_cursor(&mut app, page);
                                     }
                                 }
                             },
@@ -228,14 +434,15 @@ where
                                 Pane::FileList => {
                                     if app.current_file_idx > 0 {
                                         app.current_file_idx -= 1;
+                                        app.cursor_line = 0;
                                     }
                                 }
                                 Pane::DiffContent => {
-                                    if let Some(file) = app.file_names.get(app.current_file_idx) {
-                                        let scroll = *app.scroll_positions.get(file).unwrap_or(&0);
-                                        if scroll > 0 {
-                                            app.scroll_positions.insert(file.clone(), scroll - 1);
-                                        }
+                                    if app.cursor_line > 0 {
+                                        app.cursor_line -= 1;
+                                        let page =
+                                            terminal.size()?.height.saturating_sub(6) as usize;
+                                        scroll_to_cursor(&mut app, page);
                                     }
                                 }
                             },
@@ -253,13 +460,14 @@ where
                                         .min(app.file_names.len().saturating_sub(1));
                                 }
                                 Pane::DiffContent => {
-                                    if let Some(file) = app.file_names.get(app.current_file_idx) {
-                                        let scroll = *app.scroll_positions.get(file).unwrap_or(&0);
-                                        let page =
-                                            terminal.size()?.height.saturating_sub(6) as usize;
-                                        app.scroll_positions
-                                            .insert(file.clone(), scroll.saturating_add(page));
-                                    }
+                                    let page =
+                                        terminal.size()?.height.saturating_sub(6) as usize;
+                                    let total = diff_line_count(&app);
+                                    app.cursor_line = app
+                                        .cursor_line
+                                        .saturating_add(page)
+                                        .min(total.saturating_sub(1));
+                                    scroll_to_cursor(&mut app, page);
                                 }
                             },
                             AppMode::Rebase => {
@@ -284,13 +492,10 @@ where
                                         app.current_file_idx.saturating_sub(page);
                                 }
                                 Pane::DiffContent => {
-                                    if let Some(file) = app.file_names.get(app.current_file_idx) {
-                                        let scroll = *app.scroll_positions.get(file).unwrap_or(&0);
-                                        let page =
-                                            terminal.size()?.height.saturating_sub(6) as usize;
-                                        app.scroll_positions
-                                            .insert(file.clone(), scroll.saturating_sub(page));
-                                    }
+                                    let page =
+                                        terminal.size()?.height.saturating_sub(6) as usize;
+                                    app.cursor_line = app.cursor_line.saturating_sub(page);
+                                    scroll_to_cursor(&mut app, page);
                                 }
                             },
                             AppMode::Rebase => {
@@ -305,6 +510,7 @@ where
                                     app.current_file_idx = 0;
                                 }
                                 Pane::DiffContent => {
+                                    app.cursor_line = 0;
                                     if let Some(file) = app.file_names.get(app.current_file_idx) {
                                         app.scroll_positions.insert(file.clone(), 0);
                                     }
@@ -320,6 +526,8 @@ where
                                     app.current_file_idx = app.file_names.len().saturating_sub(1);
                                 }
                                 Pane::DiffContent => {
+                                    let total = diff_line_count(&app);
+                                    app.cursor_line = total.saturating_sub(1);
                                     if let Some(file) = app.file_names.get(app.current_file_idx) {
                                         app.scroll_positions.insert(file.clone(), usize::MAX);
                                     }
@@ -458,10 +666,9 @@ where
 mod tests {
     use super::super::theme::Theme;
     use super::*;
-    use crate::diff::FileChanges;
-    use std::collections::HashMap;
+    use crate::diff::{DiffSource, FileChanges};
 
-    fn make_app(file_names: Vec<&str>, changes_for: Vec<&str>) -> App<'static> {
+    fn make_app(file_names: Vec<&str>, changes_for: Vec<&str>) -> App {
         let file_names: Vec<String> = file_names.into_iter().map(|s| s.to_string()).collect();
         let mut rebase_changes = HashMap::new();
         for name in &file_names {
@@ -480,13 +687,12 @@ mod tests {
             };
             rebase_changes.insert(name.clone(), changes);
         }
-        // App borrows file_changes, but we only need rebase navigation,
-        // so leak an empty map to satisfy the lifetime.
-        let file_changes: &'static FileChanges = Box::leak(Box::new(HashMap::new()));
+        let file_changes: FileChanges = HashMap::new();
         App {
             file_changes,
-            left_label: "",
-            right_label: "",
+            left_label: String::new(),
+            right_label: String::new(),
+            diff_source: DiffSource::Uncommitted,
             current_file_idx: 0,
             file_names,
             scroll_positions: HashMap::new(),
@@ -502,6 +708,9 @@ mod tests {
             theme: Theme::dark(),
             theme_cycle: vec![Theme::dark(), Theme::light()],
             theme_cycle_idx: 0,
+            file_filter: crate::diff::FileFilter::new(&[], &[]).unwrap(),
+            comment_input: None,
+            cursor_line: 0,
         }
     }
 
